@@ -70,6 +70,7 @@ typedef enum
     NRF_SCAN_ERROR_UNSUPPORTED,        ///< API level error. Config parameter combination is not supported
     NRF_SCAN_ERROR_INVALID_PARAM,      ///< API level error. Invalid config parameter
     NRF_SCAN_ERROR_INVALID_STATE,      ///< API level error. nrfx driver in invalid state
+    NRF_SCAN_ERROR_TIMEOUT,            ///< API level error. sCAN did not acknowledge a request within @ref NRF_SCAN_BARRIER_TIMEOUT_US
 } nrf_scan_error_t;
 
 /** @brief sCAN state definitions */

@@ -95,6 +95,32 @@ NRF_STATIC_INLINE void sp_dppi_map_set(void * p_reg, uint32_t map_word)
     ((NRF_CAN_Type *)p_reg)->SPSYNC.DPPIMAP = map_word;
 }
 
+/* Bounded counterpart of __CSB/__ASB/__SSB. The task counter advances even on timeout, so a late
+ * echo of an abandoned request can never satisfy the next barrier. */
+static nrf_scan_error_t scan_barrier(void * p_reg, uint32_t role)
+{
+    uint32_t waited_us = 0;
+
+    sp_handshake_set(p_reg, m_task_count, 0);
+    nrf_vpr_task_trigger(NRF_VPR,
+                         (nrf_vpr_task_t)offsetof(NRF_VPR_Type, TASKS_TRIGGER[m_sp_role_task[role]]));
+
+    while (sp_handshake_get(p_reg, 0) != sp_handshake_get(p_reg, 1))
+    {
+        if (waited_us >= NRF_SCAN_BARRIER_TIMEOUT_US)
+        {
+            m_task_count++;
+            return NRF_SCAN_ERROR_TIMEOUT;
+        }
+        NRFX_DELAY_US(1);
+        waited_us++;
+    }
+
+    m_task_count++;
+
+    return NRF_SCAN_SUCCESS;
+}
+
 nrf_scan_error_t nrf_scan_init(nrf_scan_t const *       p_scan,
                                nrf_scan_event_handler_t handler,
                                void *                   p_context)
@@ -138,9 +164,18 @@ nrf_scan_error_t nrf_scan_init(nrf_scan_t const *       p_scan,
 
     nrf_vpr_cpurun_set(NRF_VPR, true);
 #ifndef UNIT_TEST
+    uint32_t waited_us = 0;
+
     while (nrf_can_enable_check((NRF_CAN_Type *)p_scan->p_reg) != false)
     {
         // Wait for peripheral to become ready to receive communication.
+        if (waited_us >= NRF_SCAN_BARRIER_TIMEOUT_US)
+        {
+            nrf_vpr_cpurun_set(NRF_VPR, false);
+            return NRF_SCAN_ERROR_TIMEOUT;
+        }
+        NRFX_DELAY_US(1);
+        waited_us++;
     }
 #endif
 
@@ -182,7 +217,11 @@ nrf_scan_error_t nrf_scan_enable(nrf_scan_t const * p_scan)
 
     nrf_can_enable((NRF_CAN_Type *)p_cb->p_hw_instance);
 
-    __ASB(p_cb->p_hw_instance);
+    nrf_scan_error_t err = scan_barrier(p_cb->p_hw_instance, SP_DPPI_ROLE_ACTION);
+    if (err != NRF_SCAN_SUCCESS)
+    {
+        return err;
+    }
 
     nrf_can_event_clear((NRF_CAN_Type *)p_cb->p_hw_instance, NRF_CAN_EVENT_TXCOMPLETE);
     nrf_can_event_clear((NRF_CAN_Type *)p_cb->p_hw_instance, NRF_CAN_EVENT_RXCOMPLETE);
@@ -219,7 +258,11 @@ static nrf_scan_error_t scan_dppi_map_publish(can_control_block_t * p_cb, uint32
      * *now*, because the soft peripheral only learns the new map while servicing it. Refreshing the
      * host-side lookup first would aim this barrier at a task that does not dispatch config yet, and
      * the wait for the echo would never end. */
-    __CSB(p_cb->p_hw_instance);
+    nrf_scan_error_t err = scan_barrier(p_cb->p_hw_instance, SP_DPPI_ROLE_CONFIG);
+    if (err != NRF_SCAN_SUCCESS)
+    {
+        return err;
+    }
 
     /* Applied now, so later barriers go to wherever the roles ended up. */
     sp_dppi_role_task_update(word);
@@ -274,9 +317,8 @@ nrf_scan_error_t nrf_scan_abort(nrf_scan_t const * p_scan)
     p_cb->prepared_pending     = false;
     p_cb->timing_configured    = false;
     p_cb->transfer_in_progress = false;
-    __SSB(p_cb->p_hw_instance);
 
-    return NRF_SCAN_SUCCESS;
+    return scan_barrier(p_cb->p_hw_instance, SP_DPPI_ROLE_STOP);
 }
 
 nrf_scan_error_t nrf_scan_disable(nrf_scan_t const * p_scan)
@@ -289,8 +331,9 @@ nrf_scan_error_t nrf_scan_disable(nrf_scan_t const * p_scan)
         return NRF_SCAN_ERROR_INVALID_STATE;
     }
 
+    /* A timed-out barrier still tears the host side down, so the driver can be enabled again. */
     nrf_scan_error_t err = nrf_scan_abort(p_scan);
-    if (err != NRF_SCAN_SUCCESS)
+    if ((err != NRF_SCAN_SUCCESS) && (err != NRF_SCAN_ERROR_TIMEOUT))
     {
         return err;
     }
@@ -301,11 +344,11 @@ nrf_scan_error_t nrf_scan_disable(nrf_scan_t const * p_scan)
 
     nrf_can_disable((NRF_CAN_Type *)p_cb->p_hw_instance);
 
-    __ASB(p_cb->p_hw_instance);
+    nrf_scan_error_t action_err = scan_barrier(p_cb->p_hw_instance, SP_DPPI_ROLE_ACTION);
 
     p_cb->state = NRFX_DRV_STATE_INITIALIZED;
 
-    return NRF_SCAN_SUCCESS;
+    return (err != NRF_SCAN_SUCCESS) ? err : action_err;
 }
 
 void nrf_scan_uninit(nrf_scan_t const * p_scan)
@@ -404,7 +447,11 @@ nrf_scan_error_t nrf_scan_timing(nrf_scan_t const *        p_scan,
     nrf_can_config_set((NRF_CAN_Type *)p_cb->p_hw_instance, &(p_cb->conf.config));
     nrf_can_set_parsing_timing((NRF_CAN_Type *)p_cb->p_hw_instance);
 
-    __CSB(p_cb->p_hw_instance);
+    nrf_scan_error_t err = scan_barrier(p_cb->p_hw_instance, SP_DPPI_ROLE_CONFIG);
+    if (err != NRF_SCAN_SUCCESS)
+    {
+        return err;
+    }
 
     p_cb->timing_configured        = true;
     m_current_request.drv_inst_idx = p_scan->drv_inst_idx;
@@ -433,9 +480,7 @@ nrf_scan_error_t nrf_scan_mode(nrf_scan_t const * p_scan, nrf_scan_mode_type_t *
     nrf_can_config_set((NRF_CAN_Type *)p_cb->p_hw_instance, &(p_cb->conf.config));
     nrf_can_set_parsing_mode((NRF_CAN_Type *)p_cb->p_hw_instance);
 
-    __CSB(p_cb->p_hw_instance);
-
-    return NRF_SCAN_SUCCESS;
+    return scan_barrier(p_cb->p_hw_instance, SP_DPPI_ROLE_CONFIG);
 }
 
 nrf_scan_error_t nrf_scan_set_rx_filter(nrf_scan_t const *           p_scan,
@@ -474,7 +519,11 @@ nrf_scan_error_t nrf_scan_set_rx_filter(nrf_scan_t const *           p_scan,
     nrf_can_rxfilter_inmailbox_set((NRF_CAN_Type *)p_cb->p_hw_instance, index, 0);
     nrf_can_set_parsing_rxfilter((NRF_CAN_Type *)p_cb->p_hw_instance);
 
-    __CSB(p_cb->p_hw_instance);
+    nrf_scan_error_t err = scan_barrier(p_cb->p_hw_instance, SP_DPPI_ROLE_CONFIG);
+    if (err != NRF_SCAN_SUCCESS)
+    {
+        return err;
+    }
 
     m_current_request.drv_inst_idx = p_scan->drv_inst_idx;
 
@@ -501,9 +550,7 @@ nrf_scan_error_t nrf_scan_disable_rx_filter(nrf_scan_t const * p_scan, uint8_t i
     nrf_can_rxfilter_usefilter_set((NRF_SP_CAN_Type *)p_cb->p_hw_instance, index, 0);
     nrf_can_set_parsing_rxfilter((NRF_CAN_Type *)p_cb->p_hw_instance);
 
-    __CSB(p_cb->p_hw_instance);
-
-    return NRF_SCAN_SUCCESS;
+    return scan_barrier(p_cb->p_hw_instance, SP_DPPI_ROLE_CONFIG);
 }
 
 nrf_scan_error_t nrf_scan_enable_rx_filter(nrf_scan_t const * p_scan, uint8_t index)
@@ -526,9 +573,7 @@ nrf_scan_error_t nrf_scan_enable_rx_filter(nrf_scan_t const * p_scan, uint8_t in
     nrf_can_rxfilter_usefilter_set((NRF_SP_CAN_Type *)p_cb->p_hw_instance, index, 1);
     nrf_can_set_parsing_rxfilter((NRF_CAN_Type *)p_cb->p_hw_instance);
 
-    __CSB(p_cb->p_hw_instance);
-
-    return NRF_SCAN_SUCCESS;
+    return scan_barrier(p_cb->p_hw_instance, SP_DPPI_ROLE_CONFIG);
 }
 
 nrf_scan_error_t nrf_scan_unlock_rx_mailbox(nrf_scan_t const * p_scan, uint8_t index)
@@ -559,9 +604,7 @@ nrf_scan_error_t nrf_scan_unlock_rx_mailbox(nrf_scan_t const * p_scan, uint8_t i
 
     nrf_can_set_parsing_rxfilter((NRF_CAN_Type *)p_cb->p_hw_instance);
 
-    __CSB(p_cb->p_hw_instance);
-
-    return NRF_SCAN_SUCCESS;
+    return scan_barrier(p_cb->p_hw_instance, SP_DPPI_ROLE_CONFIG);
 }
 
 nrf_scan_error_t nrf_scan_send(nrf_scan_t const * p_scan,
